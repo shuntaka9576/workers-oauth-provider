@@ -11,6 +11,66 @@ enum HandlerType {
   WORKER_ENTRYPOINT,
 }
 
+export interface OAuthStorageInterface {
+  get(key: string, options?: { type: 'text' | 'json' | 'arrayBuffer' | 'stream' }): Promise<any>;
+  put(key: string, value: string | ArrayBuffer, options?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
+  list(options: {
+    prefix: string;
+    limit?: number;
+    cursor?: string;
+  }): Promise<{
+    keys: { name: string }[];
+    list_complete: boolean;
+    cursor?: string;
+  }>;
+}
+
+export class CloudflareKVStorage implements OAuthStorageInterface {
+  private kv: any;
+
+  constructor(kv: any) {
+    this.kv = kv;
+  }
+
+  async get(key: string, options?: { type: 'text' | 'json' | 'arrayBuffer' | 'stream' }): Promise<any> {
+    return this.kv.get(key, options);
+  }
+
+  async put(key: string, value: string | ArrayBuffer, options?: { expirationTtl?: number }): Promise<void> {
+    return this.kv.put(key, value, options);
+  }
+
+  async delete(key: string): Promise<void> {
+    return this.kv.delete(key);
+  }
+
+  async list(options: {
+    prefix: string;
+    limit?: number;
+    cursor?: string;
+  }): Promise<{
+    keys: { name: string }[];
+    list_complete: boolean;
+    cursor?: string;
+  }> {
+    return this.kv.list(options);
+  }
+}
+
+export interface OAuthStorageFactory {
+  createStorage(env: any): OAuthStorageInterface;
+}
+
+export class DefaultOAuthStorageFactory implements OAuthStorageFactory {
+  createStorage(env: any): OAuthStorageInterface {
+    if (!env.OAUTH_KV) {
+      throw new Error('OAUTH_KV binding is missing from environment');
+    }
+    return new CloudflareKVStorage(env.OAUTH_KV);
+  }
+}
+
 /**
  * Discriminated union type for handlers
  */
@@ -206,6 +266,8 @@ export interface OAuthProviderOptions {
     status: number;
     headers: Record<string, string>;
   }) => Response | void;
+
+  storageFactory?: OAuthStorageFactory;
 }
 
 // Using ExportedHandler from Cloudflare Workers Types for both API and default handlers
@@ -701,6 +763,8 @@ class OAuthProviderImpl {
    */
   private typedApiHandlers: Array<[string, TypedHandler]>;
 
+  private storageFactory: OAuthStorageFactory;
+
   /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
@@ -765,6 +829,8 @@ class OAuthProviderImpl {
         console.warn(`OAuth error response: ${status} ${code} - ${description}`),
       ...options,
     };
+
+    this.storageFactory = options.storageFactory || new DefaultOAuthStorageFactory();
   }
 
   /**
@@ -822,6 +888,14 @@ class OAuthProviderImpl {
    */
   async fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    if (!env.OAUTH_STORAGE) {
+      const storage = this.storageFactory.createStorage(env);
+      env.OAUTH_STORAGE = storage;
+      if (!env.OAUTH_KV) {
+        env.OAUTH_KV = storage;
+      }
+    }
 
     // Special handling for OPTIONS requests (CORS preflight)
     if (request.method === 'OPTIONS') {
@@ -1202,7 +1276,8 @@ class OAuthProviderImpl {
 
     // Get the grant
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const storage = env.OAUTH_STORAGE || env.OAUTH_KV;
+    const grantData: Grant | null = await storage.get(grantKey, { type: 'json' });
 
     if (!grantData) {
       return this.createErrorResponse('invalid_grant', 'Grant not found or authorization code expired');
@@ -1373,7 +1448,7 @@ class OAuthProviderImpl {
     grantData.previousRefreshTokenWrappedKey = undefined; // No previous token for first use
 
     // Update the grant with the refresh token hash and no TTL
-    await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+    await storage.put(grantKey, JSON.stringify(grantData));
 
     // Store access token with denormalized grant information
     const accessTokenData: Token = {
@@ -1391,7 +1466,7 @@ class OAuthProviderImpl {
     };
 
     // Save access token with TTL (using the potentially callback-provided TTL)
-    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+    await storage.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
       expirationTtl: accessTokenTTL,
     });
 
@@ -1438,7 +1513,8 @@ class OAuthProviderImpl {
 
     // Get the associated grant using userId in the key
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const storage = env.OAUTH_STORAGE || env.OAUTH_KV;
+    const grantData: Grant | null = await storage.get(grantKey, { type: 'json' });
 
     if (!grantData) {
       return this.createErrorResponse('invalid_grant', 'Grant not found');
@@ -1585,7 +1661,7 @@ class OAuthProviderImpl {
     grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
 
     // Save the updated grant
-    await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData));
+    await storage.put(grantKey, JSON.stringify(grantData));
 
     // Store new access token with denormalized grant information
     const accessTokenData: Token = {
@@ -1603,7 +1679,7 @@ class OAuthProviderImpl {
     };
 
     // Save access token with TTL (using the potentially callback-provided TTL)
-    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+    await storage.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
       expirationTtl: accessTokenTTL,
     });
 
@@ -1744,7 +1820,8 @@ class OAuthProviderImpl {
     }
 
     // Store client info
-    await env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(clientInfo));
+    const storage = env.OAUTH_STORAGE || env.OAUTH_KV;
+    await storage.put(`client:${clientId}`, JSON.stringify(clientInfo));
 
     // Return client information with the original unhashed secret
     const response: Record<string, any> = {
@@ -1810,7 +1887,8 @@ class OAuthProviderImpl {
 
     // Look up the token record, which now contains the denormalized grant information
     const tokenKey = `token:${userId}:${grantId}:${accessTokenId}`;
-    const tokenData: Token | null = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
+    const storage = env.OAUTH_STORAGE || env.OAUTH_KV;
+    const tokenData: Token | null = await storage.get(tokenKey, { type: 'json' });
 
     // Verify token
     if (!tokenData) {
@@ -1882,7 +1960,8 @@ class OAuthProviderImpl {
    */
   getClient(env: any, clientId: string): Promise<ClientInfo | null> {
     const clientKey = `client:${clientId}`;
-    return env.OAUTH_KV.get(clientKey, { type: 'json' });
+    const storage = env.OAUTH_STORAGE || env.OAUTH_KV;
+    return storage.get(clientKey, { type: 'json' });
   }
 
   /**
@@ -2168,6 +2247,7 @@ async function unwrapKeyWithToken(tokenStr: string, wrappedKeyBase64: string): P
 class OAuthHelpersImpl implements OAuthHelpers {
   private env: any;
   private provider: OAuthProviderImpl;
+  private storage: OAuthStorageInterface;
 
   /**
    * Creates a new OAuthHelpers instance
@@ -2177,6 +2257,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
   constructor(env: any, provider: OAuthProviderImpl) {
     this.env = env;
     this.provider = provider;
+    this.storage = env.OAUTH_STORAGE || env.OAUTH_KV;
   }
 
   /**
@@ -2279,7 +2360,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       // Store the grant with a key that includes the user ID
       const grantKey = `grant:${options.userId}:${grantId}`;
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant));
+      await this.storage.put(grantKey, JSON.stringify(grant));
 
       // Store access token with denormalized grant information
       const accessTokenData: Token = {
@@ -2297,7 +2378,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       };
 
       // Save access token with TTL
-      await this.env.OAUTH_KV.put(
+      await this.storage.put(
         `token:${options.userId}:${grantId}:${accessTokenId}`,
         JSON.stringify(accessTokenData),
         { expirationTtl: accessTokenTTL }
@@ -2352,7 +2433,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
       // Set 10-minute TTL for the grant (will be extended when code is exchanged)
       const codeExpiresIn = 600; // 10 minutes
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
+      await this.storage.put(grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
 
       // Build the redirect URL for authorization code flow
       const redirectUrl = new URL(options.request.redirectUri);
@@ -2402,7 +2483,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       newClient.clientSecret = await hashSecret(clientSecret);
     }
 
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(newClient));
+    await this.storage.put(`client:${clientId}`, JSON.stringify(newClient));
 
     // Create the response object
     const clientResponse = { ...newClient };
@@ -2434,8 +2515,8 @@ class OAuthHelpersImpl implements OAuthHelpers {
       listOptions.cursor = options.cursor;
     }
 
-    // Use the KV list() function to get client keys with pagination
-    const response = await this.env.OAUTH_KV.list(listOptions);
+    // Use the storage list() function to get client keys with pagination
+    const response = await this.storage.list(listOptions);
 
     // Fetch all clients in parallel
     const clients: ClientInfo[] = [];
@@ -2499,7 +2580,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       delete updatedClient.clientSecret;
     }
 
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(updatedClient));
+    await this.storage.put(`client:${clientId}`, JSON.stringify(updatedClient));
 
     // Create a response object
     const response = { ...updatedClient };
@@ -2519,7 +2600,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
    */
   async deleteClient(clientId: string): Promise<void> {
     // Delete client
-    await this.env.OAUTH_KV.delete(`client:${clientId}`);
+    await this.storage.delete(`client:${clientId}`);
   }
 
   /**
@@ -2543,13 +2624,13 @@ class OAuthHelpersImpl implements OAuthHelpers {
       listOptions.cursor = options.cursor;
     }
 
-    // Use the KV list() function to get grant keys with pagination
-    const response = await this.env.OAUTH_KV.list(listOptions);
+    // Use the storage list() function to get grant keys with pagination
+    const response = await this.storage.list(listOptions);
 
     // Fetch all grants in parallel and convert to grant summaries
     const grantSummaries: GrantSummary[] = [];
     const promises = response.keys.map(async (key: { name: string }) => {
-      const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+      const grantData: Grant | null = await this.storage.get(key.name, { type: 'json' });
       if (grantData) {
         // Create a summary with only the public fields
         const summary: GrantSummary = {
@@ -2600,13 +2681,13 @@ class OAuthHelpersImpl implements OAuthHelpers {
         listOptions.cursor = cursor;
       }
 
-      const result = await this.env.OAUTH_KV.list(listOptions);
+      const result = await this.storage.list(listOptions);
 
       // Delete each token in this batch
       if (result.keys.length > 0) {
         await Promise.all(
           result.keys.map((key: { name: string }) => {
-            return this.env.OAUTH_KV.delete(key.name);
+            return this.storage.delete(key.name);
           })
         );
       }
@@ -2620,7 +2701,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
     }
 
     // After all tokens are deleted, delete the grant itself
-    await this.env.OAUTH_KV.delete(grantKey);
+    await this.storage.delete(grantKey);
   }
 }
 
