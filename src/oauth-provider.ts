@@ -1,5 +1,8 @@
 import { ExportedHandler, ExecutionContext } from '@cloudflare/workers-types';
-import { WorkerEntrypoint } from 'cloudflare:workers';
+
+export interface WorkerEntrypoint {
+  fetch(request: Request): Response | Promise<Response>;
+}
 
 // Types
 
@@ -868,8 +871,11 @@ class OAuthProviderImpl {
       return { type: HandlerType.EXPORTED_HANDLER, handler };
     }
 
-    // Check if it's a class constructor extending WorkerEntrypoint
-    if (typeof handler === 'function' && handler.prototype instanceof WorkerEntrypoint) {
+    // Check if it's a class constructor with a prototype that has a fetch method
+    // This is a more generic check that doesn't require WorkerEntrypoint to be a class
+    if (typeof handler === 'function' &&
+        handler.prototype &&
+        typeof handler.prototype.fetch === 'function') {
       return { type: HandlerType.WORKER_ENTRYPOINT, handler };
     }
 
